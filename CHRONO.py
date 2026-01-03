@@ -5,26 +5,44 @@ import math
 import time
 from ultralytics import YOLO
 import os
+import threading
+import serial
 
-ALERT_IMAGE_PATH = r"C:\Users\hp\Downloads\alert.png"
-EMOTION_MODEL = r"C:\Users\hp\Downloads\your_model.onnx"
 
+ALERT_IMAGE_PATH = "/home/kfakh/Desktop/Ai_Model.2/alert.png"
+EMOTION_MODEL = "/home/kfakh/Desktop/Ai_Model.2/your_model.onnx"
 EMOTIONS = ["fear","neutral","happy","sad","anger","disgust","surprise","contempt"]
-NEGATIVE_EMOTIONS = {"fear","disgust","surprise"}
+NEGATIVE_EMOTIONS = {"fear","disgust","surprise","sad","anger"}
 
-HAND_NEAR_THRESHOLD = 60  
-ALERT_DURATION = 2        
-
+HAND_NEAR_THRESHOLD = 60
+ALERT_DURATION = 2.0
+SERIAL_PORT = "/dev/ttyACM0" 
+BAUD_RATE = 9600
+last_frame = None
+condition_start_time = None
+alert_sent = False
+asthma_alert = False
 emotion_sess = ort.InferenceSession(EMOTION_MODEL, providers=["CPUExecutionProvider"])
 emotion_in = emotion_sess.get_inputs()[0].name
 emotion_out = emotion_sess.get_outputs()[0].name
 
-pose_model = YOLO("yolov8n-pose.pt")
+pose_model = YOLO("yolov8n-pose.onnx")
+
 alert_img = cv2.imread(ALERT_IMAGE_PATH) if os.path.exists(ALERT_IMAGE_PATH) else None
+try:
+    robot_serial = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)  # stabilize connection
+    print("✔ Robot serial connected")
+except:
+    robot_serial = None
+    print("✖ Serial connection failed")
 
-
-condition_start_time = None  
-asthma_alert = False       
+def grab_last_frame(cap):
+    global last_frame
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            last_frame = frame.copy()
 def check_hand_near_neck(kp_xy, kp_conf):
     LS, RS = 5, 6
     LW, RW = 9, 10
@@ -35,74 +53,85 @@ def check_hand_near_neck(kp_xy, kp_conf):
     neck_x = (kp_xy[LS][0] + kp_xy[RS][0]) / 2
     neck_y = (kp_xy[LS][1] + kp_xy[RS][1]) / 2
 
-    hands = []
-    if kp_conf[LW] > 0.3: hands.append(kp_xy[LW])
-    if kp_conf[RW] > 0.3: hands.append(kp_xy[RW])
-
-    if len(hands) == 0: return False
-
-    for hx, hy in hands:
-        if math.dist((hx, hy), (neck_x, neck_y)) < HAND_NEAR_THRESHOLD:
-            return True
+    for idx in [LW, RW]:
+        if kp_conf[idx] > 0.3:
+            hx, hy = kp_xy[idx]
+            if math.dist((hx, hy), (neck_x, neck_y)) < HAND_NEAR_THRESHOLD:
+                return True
 
     return False
 cap = cv2.VideoCapture(0)
-cap.set(3, 640)
-cap.set(4, 480)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+threading.Thread(target=grab_last_frame, args=(cap,), daemon=True).start()
 
 print("✔ Webcam Asthma Detection Started (2s validation)")
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    if last_frame is None:
+        continue
+
+    frame = last_frame.copy()
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     e_in = cv2.resize(gray, (64,64)).astype(np.float32) / 255.0
     e_in = e_in.reshape(1,64,64,1)
-    
-    logits = emotion_sess.run([emotion_out], {emotion_in: e_in})[0][0]
-    probs = np.exp(logits) / np.sum(np.exp(logits))
+
+    probs = emotion_sess.run([emotion_out], {emotion_in: e_in})[0][0]
     emotion = EMOTIONS[int(np.argmax(probs))]
-    
     negative_emotion = emotion.lower() in NEGATIVE_EMOTIONS
-    cv2.putText(frame, f"Emotion: {emotion}", (10,30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
     hand_near = False
     if negative_emotion:
         results = pose_model(frame, verbose=False)
-        if results[0].keypoints is not None:
+        if results[0].keypoints is not None and len(results[0].keypoints.xy) > 0:
             kp_xy = results[0].keypoints.xy[0].cpu().numpy()
             kp_conf = results[0].keypoints.conf[0].cpu().numpy()
 
-            for i,(x,y) in enumerate(kp_xy):
+            for i, (x, y) in enumerate(kp_xy):
                 if kp_conf[i] > 0.3:
-                    cv2.circle(frame,(int(x),int(y)),4,(0,255,0),-1)
+                    cv2.circle(frame, (int(x), int(y)), 4, (0,255,0), -1)
 
             hand_near = check_hand_near_neck(kp_xy, kp_conf)
+
     current_condition = negative_emotion and hand_near
 
     if current_condition:
         if condition_start_time is None:
-            condition_start_time = time.time() 
+            condition_start_time = time.time()
         elif time.time() - condition_start_time >= ALERT_DURATION:
-            asthma_alert = True  
+            asthma_alert = True
+            if not alert_sent and robot_serial is not None:
+                    robot_serial.write(b"ASTHMA_DETECTED\n")
+                    print("📤 ASTHMA_DETECTED sent to ESP")
+                    alert_sent = True
     else:
-        condition_start_time = None  
-        asthma_alert = False         
-
+       condition_start_time = None
+       asthma_alert = False
+       alert_sent = False
+    display = frame.copy()
 
     if asthma_alert and alert_img is not None:
-        display = cv2.resize(alert_img, (frame.shape[1], frame.shape[0]))
+        overlay = cv2.resize(alert_img, (display.shape[1], display.shape[0]))
+        display = cv2.addWeighted(display, 0.6, overlay, 0.4, 0)
         cv2.putText(display, "!!! ASTHMA ALERT !!!", (50,50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
-    else:
-        display = frame.copy()
-
 
     if current_condition and not asthma_alert:
         time_left = ALERT_DURATION - (time.time() - condition_start_time)
         cv2.putText(display, f"Validating: {time_left:.1f}s",
                     (10,70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+    cv2.putText(display, f"Emotion: {emotion}", (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+    cv2.putText(display, f"Negative: {negative_emotion}", (10,100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+    cv2.putText(display, f"Hand Near Neck: {hand_near}", (10,130),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
     cv2.imshow("Asthma AI", display)
 
@@ -111,3 +140,5 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+if robot_serial is not None:
+    robot_serial.close()
